@@ -799,13 +799,13 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 			for topic, partitions := range task.blocks {
 				for partition, block := range partitions {
 					e.mu.RLock()
+					bid, tracked := topicPartitionLeaders[topic][partition]
 					lag := offset[topic][partition] - block.Offset
 					e.mu.RUnlock()
 
-					if block.Offset != -1 && lag < 0 {
-						e.mu.RLock()
-						bid := topicPartitionLeaders[topic][partition]
-						e.mu.RUnlock()
+					// Consumer groups may include topics excluded from Phase 1.
+					// Skip them because no cached offset or leader is available.
+					if tracked && block.Offset != -1 && lag < 0 {
 						if _, ok := toRefresh[bid]; !ok {
 							toRefresh[bid] = &sarama.OffsetRequest{}
 						}
@@ -1080,8 +1080,8 @@ func main() {
 	toFlagStringVar("refresh.metadata", "Metadata refresh interval", "30s", &opts.metadataRefreshInterval)
 	toFlagBoolVar("offset.show-all", "Whether show the offset/lag for all consumer group, otherwise, only show connected consumer groups, default is true", true, "true", &opts.offsetShowAll)
 	toFlagBoolVar("concurrent.enable", "If true, all scrapes will trigger kafka operations otherwise, they will share results. WARN: This should be disabled on large clusters. Default is false", false, "false", &opts.allowConcurrent)
-	toFlagIntVar("topic.workers", "Number of topic workers", 100, "100", &opts.topicWorkers)
-	toFlagIntVar("group.workers", "Number of consumer group workers", 100, "100", &opts.groupWorkers)
+	toFlagIntVar("topic.workers", "Maximum number of concurrent broker offset fetch tasks; <= 0 means no limit", 100, "100", &opts.topicWorkers)
+	toFlagIntVar("group.workers", "Maximum number of concurrent broker consumer group tasks; <= 0 means no limit", 100, "100", &opts.groupWorkers)
 	toFlagBoolVar("kafka.allow-auto-topic-creation", "If true, the broker may auto-create topics that we requested which do not already exist, default is false.", false, "false", &opts.allowAutoTopicCreation)
 	toFlagIntVar("verbosity", "Verbosity log level", 0, "0", &opts.verbosityLogLevel)
 	toFlagStringVar("group.metrics.timeout", "Timeout for emitting consumer group metrics", "5m", &opts.groupMetricsTimeout)
