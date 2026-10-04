@@ -102,6 +102,7 @@ type kafkaOpts struct {
 	saslDisablePAFXFast      bool
 	saslAwsRegion            string
 	saslOAuthBearerTokenUrl  string
+	saslOAuthBearerTokenFile string
 	saslOAuthBearerScopes    string
 	useTLS                   bool
 	tlsServerName            string
@@ -179,6 +180,21 @@ func (o *oauthbearerTokenProvider) Token() (*sarama.AccessToken, error) {
 	return &sarama.AccessToken{Token: accessToken}, err
 }
 
+// fileTokenProvider returns a bearer token read from a file on every call,
+// supporting credentials that are rotated on disk (e.g. Kubernetes projected
+// service account tokens).
+type fileTokenProvider struct {
+	path string
+}
+
+func (f *fileTokenProvider) Token() (*sarama.AccessToken, error) {
+	data, err := os.ReadFile(f.path)
+	if err != nil {
+		return nil, fmt.Errorf("read oauthbearer token file %q: %w", f.path, err)
+	}
+	return &sarama.AccessToken{Token: strings.TrimSpace(string(data))}, nil
+}
+
 // CanReadCertAndKey returns true if the certificate and key files already exists,
 // otherwise returns false. If lost one of cert and key, returns error.
 func CanReadCertAndKey(certPath, keyPath string) (bool, error) {
@@ -228,6 +244,11 @@ func NewExporter(opts kafkaOpts, topicFilter string, topicExclude string, groupF
 		// Convert to lowercase so that SHA512 and SHA256 is still valid
 		opts.saslMechanism = strings.ToLower(opts.saslMechanism)
 
+		saslUsername := opts.saslUsername
+		if saslUsername == "" {
+			saslUsername = os.Getenv("SASL_USER_NAME")
+		}
+
 		saslPassword := opts.saslPassword
 		if saslPassword == "" {
 			saslPassword = os.Getenv("SASL_USER_PASSWORD")
@@ -245,7 +266,7 @@ func NewExporter(opts kafkaOpts, topicFilter string, topicExclude string, groupF
 			config.Net.SASL.GSSAPI.ServiceName = opts.serviceName
 			config.Net.SASL.GSSAPI.KerberosConfigPath = opts.kerberosConfigPath
 			config.Net.SASL.GSSAPI.Realm = opts.realm
-			config.Net.SASL.GSSAPI.Username = opts.saslUsername
+			config.Net.SASL.GSSAPI.Username = saslUsername
 			if opts.kerberosAuthType == "keytabAuth" {
 				config.Net.SASL.GSSAPI.AuthType = sarama.KRB5_KEYTAB_AUTH
 				config.Net.SASL.GSSAPI.KeyTabPath = opts.keyTabPath
@@ -261,24 +282,31 @@ func NewExporter(opts kafkaOpts, topicFilter string, topicExclude string, groupF
 			config.Net.SASL.TokenProvider = &MSKAccessTokenProvider{region: opts.saslAwsRegion}
 		case "oauthbearer":
 			config.Net.SASL.Mechanism = sarama.SASLMechanism(sarama.SASLTypeOAuth)
-			tokenUrl := opts.saslOAuthBearerTokenUrl
-			if tokenUrl == "" {
-				tokenUrl = os.Getenv("SASL_OAUTHBEARER_TOKEN_URL")
+			tokenFile := opts.saslOAuthBearerTokenFile
+			if tokenFile == "" {
+				tokenFile = os.Getenv("SASL_OAUTHBEARER_TOKEN_FILE")
 			}
-			if tokenUrl == "" {
-				log.Fatalf("[ERROR] sasl.oauthbearer-token-url must be configured or SASL_OAUTHBEARER_TOKEN_URL environment variable must be set when using the OAuthBearer SASL mechanism")
+			if tokenFile != "" {
+				config.Net.SASL.TokenProvider = &fileTokenProvider{path: tokenFile}
+			} else {
+				tokenUrl := opts.saslOAuthBearerTokenUrl
+				if tokenUrl == "" {
+					tokenUrl = os.Getenv("SASL_OAUTHBEARER_TOKEN_URL")
+				}
+				if tokenUrl == "" {
+					log.Fatalf("[ERROR] sasl.oauthbearer-token-url or sasl.oauthbearer-token-file must be configured (or SASL_OAUTHBEARER_TOKEN_URL / SASL_OAUTHBEARER_TOKEN_FILE environment variable must be set) when using the OAuthBearer SASL mechanism")
+				}
+				if saslUsername == "" {
+					log.Fatalf("[ERROR] sasl.username must be configured or SASL_USER_NAME environment variable must be set when using the OAuthBearer SASL mechanism with sasl.oauthbearer-token-url")
+				}
+				oauth2Config := clientcredentials.Config{
+					TokenURL:     tokenUrl,
+					ClientID:     saslUsername,
+					ClientSecret: saslPassword,
+					Scopes:       strings.Split(opts.saslOAuthBearerScopes, ","),
+				}
+				config.Net.SASL.TokenProvider = newOauthbearerTokenProvider(&oauth2Config)
 			}
-			saslUsername := opts.saslUsername
-			if saslUsername == "" {
-				log.Fatalf("[ERROR] sasl.username must be configured when using the OAuthBearer SASL mechanism")
-			}
-			oauth2Config := clientcredentials.Config{
-				TokenURL:     tokenUrl,
-				ClientID:     saslUsername,
-				ClientSecret: saslPassword,
-				Scopes:       strings.Split(opts.saslOAuthBearerScopes, ","),
-			}
-			config.Net.SASL.TokenProvider = newOauthbearerTokenProvider(&oauth2Config)
 		case "plain":
 		default:
 			return nil, fmt.Errorf(
@@ -290,8 +318,8 @@ func NewExporter(opts kafkaOpts, topicFilter string, topicExclude string, groupF
 		config.Net.SASL.Enable = true
 		config.Net.SASL.Handshake = opts.useSASLHandshake
 
-		if opts.saslUsername != "" {
-			config.Net.SASL.User = opts.saslUsername
+		if saslUsername != "" {
+			config.Net.SASL.User = saslUsername
 		}
 
 		if saslPassword != "" {
@@ -450,13 +478,16 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 func (e *Exporter) collectChans(quit chan struct{}) {
 	original := make(chan prometheus.Metric)
 	container := make([]prometheus.Metric, 0, 100)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for metric := range original {
 			container = append(container, metric)
 		}
 	}()
 	e.collect(original)
 	close(original)
+	<-done
 	// Lock to avoid modification on the channel slice
 	e.sgMutex.Lock()
 	for _, ch := range e.sgChans {
@@ -710,7 +741,8 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 		}
 		defer broker.Close()
 
-		groups, err := broker.ListGroups(&sarama.ListGroupsRequest{})
+		version := e.client.Config().Version
+		groups, err := broker.ListGroups(newListGroupsRequest(version))
 		if err != nil {
 			klog.Errorf("Cannot get consumer group: %v", err)
 			return
@@ -721,17 +753,10 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 				groupIds = append(groupIds, groupId)
 			}
 		}
-
-		describeGroups, err := broker.DescribeGroups(&sarama.DescribeGroupsRequest{Groups: groupIds})
+		groupInfos, err := describeGroupsByType(broker, groupIds, groups.GroupsData, version)
 		if err != nil {
-			klog.Errorf("Cannot get describe groups: %v", err)
-			return
+			klog.Errorf("Cannot describe all consumer groups on broker %s: %v", broker.Addr(), err)
 		}
-		for _, group := range describeGroups.Groups {
-			if group.Err != 0 {
-				klog.Errorf("Cannot describe for the group %s with error code %d", group.GroupId, group.Err)
-				continue
-			}
 
 			// calculate and export the group metrics; groups with negative lag are deferred for later processing
 			task := e.emitGroupMetric(group, broker, offset, ch)
@@ -886,7 +911,7 @@ func (e *Exporter) emitGroupMetric(group *sarama.GroupDescription, broker *saram
 	}
 
 	ch <- prometheus.MustNewConstMetric(
-		consumergroupMembers, prometheus.GaugeValue, float64(len(group.Members)), group.GroupId,
+		consumergroupMembers, prometheus.GaugeValue, float64(group.memberCount), group.id,
 	)
 
 	offsetFetchResponse, err := broker.FetchOffset(&offsetFetchRequest)
@@ -1054,6 +1079,7 @@ func main() {
 	toFlagStringVar("sasl.password", "SASL user password.", "", &opts.saslPassword)
 	toFlagStringVar("sasl.aws-region", "The AWS region for IAM SASL authentication", os.Getenv("AWS_REGION"), &opts.saslAwsRegion)
 	toFlagStringVar("sasl.oauthbearer-token-url", "The url to retrieve OAuthBearer tokens from, for OAuthBearer SASL authentication", "", &opts.saslOAuthBearerTokenUrl)
+	toFlagStringVar("sasl.oauthbearer-token-file", "Path to a file containing an OAuthBearer token (e.g. a Kubernetes projected service account token). The file is re-read on each SASL handshake. Takes precedence over sasl.oauthbearer-token-url.", "", &opts.saslOAuthBearerTokenFile)
 	toFlagStringVar("sasl.oauthbearer-scopes", "The comma-separated scopes to use for OAuthBearer SASL authentication", "", &opts.saslOAuthBearerScopes)
 	toFlagStringVar("sasl.mechanism", "SASL SCRAM SHA algorithm: sha256 or sha512 or SASL mechanism: gssapi, awsiam or oauthbearer", "", &opts.saslMechanism)
 	toFlagStringVar("sasl.service-name", "Service name when using kerberos Auth", "", &opts.serviceName)
@@ -1105,6 +1131,35 @@ func main() {
 	}
 
 	setup(*listenAddress, *metricsPath, *topicFilter, *topicExclude, *groupFilter, *groupExclude, *logSarama, opts, labels)
+}
+
+func newHTTPHandler(metricsPath string, metricsHandler http.Handler) http.Handler {
+	mux := http.NewServeMux()
+
+	mux.Handle(metricsPath, metricsHandler)
+	if metricsPath != "/" {
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			_, err := w.Write([]byte(`<html>
+	        <head><title>Kafka Exporter</title></head>
+	        <body>
+	        <h1>Kafka Exporter</h1>
+	        <p><a href='` + metricsPath + `'>Metrics</a></p>
+	        </body>
+	        </html>`))
+			if err != nil {
+				klog.Error("Error handle / request", err)
+			}
+		})
+	}
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		// need more specific sarama check
+		_, err := w.Write([]byte("ok"))
+		if err != nil {
+			klog.Error("Error handle /healthz request", err)
+		}
+	})
+
+	return mux
 }
 
 func setup(
@@ -1234,28 +1289,7 @@ func setup(
 	defer exporter.client.Close()
 	prometheus.MustRegister(exporter)
 
-	mux := http.NewServeMux()
-
-	mux.Handle(metricsPath, promhttp.Handler())
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		_, err := w.Write([]byte(`<html>
-	        <head><title>Kafka Exporter</title></head>
-	        <body>
-	        <h1>Kafka Exporter</h1>
-	        <p><a href='` + metricsPath + `'>Metrics</a></p>
-	        </body>
-	        </html>`))
-		if err != nil {
-			klog.Error("Error handle / request", err)
-		}
-	})
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		// need more specific sarama check
-		_, err := w.Write([]byte("ok"))
-		if err != nil {
-			klog.Error("Error handle /healthz request", err)
-		}
-	})
+	mux := newHTTPHandler(metricsPath, promhttp.Handler())
 
 	if opts.serverUseTLS {
 		klog.V(INFO).Infoln("Listening on HTTPS", listenAddress)

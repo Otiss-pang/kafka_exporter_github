@@ -3,7 +3,7 @@
 kafka_exporter
 ==============
 
-[![CI](https://github.com/danielqsj/kafka_exporter/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/danielqsj/kafka_exporter/actions/workflows/ci.yml)[![Docker Pulls](https://img.shields.io/docker/pulls/danielqsj/kafka-exporter.svg)](https://hub.docker.com/r/danielqsj/kafka-exporter)[![Go Report Card](https://goreportcard.com/badge/github.com/danielqsj/kafka_exporter)](https://goreportcard.com/report/github.com/danielqsj/kafka_exporter)[![Language](https://img.shields.io/badge/language-Go-red.svg)](https://github.com/danielqsj/kafka-exporter)[![GitHub release](https://img.shields.io/badge/release-1.9.0-green.svg)](https://github.com/danielqsj/kafka-exporter/releases)[![License](https://img.shields.io/badge/license-Apache%202-4EB1BA.svg)](https://www.apache.org/licenses/LICENSE-2.0.html)
+[![CI](https://github.com/danielqsj/kafka_exporter/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/danielqsj/kafka_exporter/actions/workflows/ci.yml)[![Docker Pulls](https://img.shields.io/docker/pulls/danielqsj/kafka-exporter.svg)](https://hub.docker.com/r/danielqsj/kafka-exporter)[![Go Report Card](https://goreportcard.com/badge/github.com/danielqsj/kafka_exporter)](https://goreportcard.com/report/github.com/danielqsj/kafka_exporter)[![Language](https://img.shields.io/badge/language-Go-red.svg)](https://github.com/danielqsj/kafka-exporter)[![GitHub release](https://img.shields.io/badge/release-1.10.0-green.svg)](https://github.com/danielqsj/kafka-exporter/releases)[![License](https://img.shields.io/badge/license-Apache%202-4EB1BA.svg)](https://www.apache.org/licenses/LICENSE-2.0.html)
 
 Kafka exporter for Prometheus. For other metrics from Kafka, have a look at the [JMX exporter](https://github.com/prometheus/jmx_exporter).
 
@@ -118,6 +118,7 @@ This image is configurable using different flags
 | sasl.mechanism                 | plain          | SASL SCRAM SHA algorithm: sha256 or sha512 or SASL mechanism: gssapi, awsiam or oauthbearer                                                    |
 | sasl.aws-region                | AWS_REGION env | The AWS region for IAM SASL authentication                                                                                                     |
 | sasl.oauthbearer-token-url     |                | The url to retrieve OAuthBearer tokens from, for OAuthBearer SASL authentication                                                               |
+| sasl.oauthbearer-token-file    |                | Path to a file containing an OAuthBearer token (e.g. a Kubernetes projected service account token). Re-read on each SASL handshake. Takes precedence over `sasl.oauthbearer-token-url` |
 | sasl.oauthbearer-scopes        |                | The comma-separated scopes to use for OAuthBearer SASL authentication authentication                                                               |
 | sasl.service-name              |                | Service name when using Kerberos Auth                                                                                                          |
 | sasl.kerberos-config-path      |                | Kerberos config path                                                                                                                           |
@@ -249,7 +250,13 @@ kafka_topic_partition_under_replicated_partition{partition="0",topic="__consumer
 
 **Required permissions**
 
-Describe all groups.
+Describe all groups. KIP-848 groups also require Describe access to their
+subscribed topics.
+
+On Kafka 3.8+, the exporter uses the group type from `ListGroups` to select
+`ConsumerGroupDescribe` or `DescribeGroups`. Kafka 3.7 KIP-848 is not supported
+because it is early access and `ListGroups` does not expose the group type. Set
+`kafka.version` to the broker version.
 
 **Metrics details**
 
@@ -334,7 +341,13 @@ Thanks goes to these wonderful people:
 Star ⭐
 ----------
 
-[![Stargazers over time](https://starchart.cc/danielqsj/kafka_exporter.svg)](https://starchart.cc/danielqsj/kafka_exporter)
+<a href="https://www.star-history.com/?repos=danielqsj%2Fkafka_exporter&type=date&legend=bottom-right">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=danielqsj/kafka_exporter&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=danielqsj/kafka_exporter&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=danielqsj/kafka_exporter&type=date&legend=top-left" />
+ </picture>
+</a>
 
 Donation
 --------
